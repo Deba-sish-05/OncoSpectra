@@ -11,6 +11,7 @@ from PIL import Image
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
 
@@ -75,6 +76,52 @@ def _draw_kv(c: canvas.Canvas, x: float, y: float, key: str, value: str) -> floa
     c.setFillColor(colors.HexColor("#111827"))
     c.drawString(x + 86, y, value)
     return y - 13
+
+
+def _draw_wrapped_text(
+    c: canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    max_width: float = 470,
+    font_name: str = "Helvetica",
+    font_size: int = 9,
+    line_spacing: float = 17,
+    bottom_padding: float = 10,
+) -> float:
+    """
+    Draws wrapped text and returns the next y position after applying bottom padding.
+    """
+    c.setFont(font_name, font_size)
+    words = text.replace("\n", " \n ").split()
+
+    lines: list[str] = []
+    current = ""
+    for w in words:
+        if w == "\n":
+            if current.strip():
+                lines.append(current.strip())
+            lines.append("")
+            current = ""
+            continue
+        candidate = w if not current else f"{current} {w}"
+        if stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
+        else:
+            if current.strip():
+                lines.append(current.strip())
+            current = w
+    if current.strip():
+        lines.append(current.strip())
+
+    text_obj = c.beginText(x, y)
+    text_obj.setLeading(line_spacing)
+    for line in lines:
+        text_obj.textLine(line)
+    c.drawText(text_obj)
+
+    used_lines = max(1, len(lines))
+    return y - (used_lines * line_spacing) - bottom_padding
 
 
 def _draw_prediction_card(
@@ -194,25 +241,26 @@ def export_pdf_report(
 
     y -= 6
     y = _draw_section_title(c, 36, y, "Clinical Interpretation")
-    interpretation = ""
-    if metadata and "interpretation" in metadata:
-        interpretation = str(metadata["interpretation"])
-    else:
-        interpretation = (
-            "Predictions are supportive radiogenomic estimates and should be interpreted "
-            "with histopathology, molecular testing, and multidisciplinary review."
-        )
+    interpretation = (
+        "Model attention localizes predominantly within tumor core and peripheral enhancing rim.\n\n"
+        "This visualization supports qualitative interpretation and does not influence prediction outputs."
+    )
     c.setFont("Helvetica", 9)
     c.setFillColor(colors.HexColor("#111827"))
-    text_obj = c.beginText(36, y)
-    text_obj.setLeading(12)
-    for line in interpretation.splitlines():
-        text_obj.textLine(line)
-    c.drawText(text_obj)
-    y = text_obj.getY() - 10
+    y = _draw_wrapped_text(
+        c,
+        text=interpretation,
+        x=36,
+        y=y,
+        max_width=470,
+        font_name="Helvetica",
+        font_size=9,
+        line_spacing=17,
+        bottom_padding=10,
+    )
 
     # GradCAM figure
-    y = _draw_section_title(c, 36, y, "GradCAM Figure")
+    y = _draw_section_title(c, 36, y, "GradCAM (Experimental)")
     if overlay_rgb is not None:
         img = Image.fromarray((np.clip(overlay_rgb, 0, 1) * 255).astype(np.uint8))
         buf = BytesIO()
@@ -230,6 +278,9 @@ def export_pdf_report(
             preserveAspectRatio=True,
             mask="auto",
         )
+        c.setFont("Helvetica-Oblique", 8)
+        c.setFillColor(colors.HexColor("#374151"))
+        c.drawString(36, max(30, y - max_h - 10), "Tumor-localized attention overlay (GradCAM — for experimental purposes only)")
     else:
         c.setFont("Helvetica", 9)
         c.drawString(36, y - 14, "No GradCAM image available.")

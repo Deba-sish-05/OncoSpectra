@@ -86,7 +86,7 @@ def _render_modality_previews(
     st.markdown("#### MRI Preview")
     preview_slice = _resolve_preview_slice(modality_paths, seg_path)
 
-    cols = st.columns(5)
+    cols = st.columns(4)
     for i, mod in enumerate(MODALITIES):
         vol = _load_volume(str(modality_paths[mod]))
         slice_idx = max(0, min(preview_slice, vol.shape[2] - 1))
@@ -94,17 +94,11 @@ def _render_modality_previews(
         label = f"{mod.upper()} (slice {preview_slice})"
         cols[i].image(_normalize_for_display(sl), caption=label, use_container_width=True)
 
-    with cols[4]:
-        if seg_path is not None and seg_path.exists():
-            segv = _load_volume(str(seg_path))
-            slice_idx = max(0, min(preview_slice, segv.shape[2] - 1))
-            seg = segv[:, :, slice_idx]
-            st.image(_normalize_for_display(seg), caption=f"SEG Mask (slice {preview_slice})", use_container_width=True)
-        else:
-            st.info("No SEG")
 
+def _cam_localization_text(cam: np.ndarray | None, seg_mask: np.ndarray | None) -> str:
+    if cam is None:
+        return "GradCAM attention is unavailable because no segmentation mask was provided."
 
-def _cam_localization_text(cam: np.ndarray, seg_mask: np.ndarray | None) -> str:
     hot = cam > np.percentile(cam, 92)
     if hot.sum() == 0:
         return "Model attention is focal but weak; localization confidence is limited."
@@ -203,7 +197,7 @@ st.markdown(
 st.title("Brain Tumor Radiogenomics Dashboard")
 st.caption(
     "Final paper-aligned deployment: ResNet50-v2 multi-task backbone, 2-seed ensemble + horizontal flip TTA, "
-    "IDH threshold = 0.49, GradCAM++ on layer4[-1]."
+    "IDH threshold = 0.49, segmentation-guided GradCAM (experimental visualization)."
 )
 
 
@@ -288,7 +282,7 @@ if run_clicked:
         st.error(f"Missing required modalities: {missing_modalities}")
         st.stop()
 
-    with st.spinner("Running preprocessing, ensemble inference, and GradCAM++..."):
+    with st.spinner("Running preprocessing, ensemble inference, and GradCAM..."):
         input_np, used_slice = build_input_tensor(modality_paths=modality_paths, seg_path=seg_path)
         input_tensor = torch.from_numpy(input_np).unsqueeze(0).to(device)
 
@@ -402,10 +396,10 @@ if "last_result" in st.session_state:
         unsafe_allow_html=True,
     )
 
-    st.markdown("### GradCAM++")
+    st.markdown("### GradCAM (Experimental)")
     g1, g2 = st.columns(2)
     g1.image(base_rgb, caption="Anatomical Slice (T1ce)", use_container_width=True)
-    g2.image(overlay, caption="Localized GradCAM++ Hotspot Overlay", use_container_width=True)
+    g2.image(overlay, caption="Localized GradCAM+ Hotspot Overlay", use_container_width=True)
 
     report_name = f"radiogenomics_report_{case_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     report_path = REPORTS_DIR / report_name
