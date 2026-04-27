@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+env/
+
+.streamlit/
+
+reports/*.pdf
+reports/*.png
+
+*.log
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+
+# huge model files
+weights/*.pth
+weights/*.pt
+
+# medical images
+data/**/*.nii
+data/**/*.nii.gz
+
+# temp
+*.tmp
+*.cache
