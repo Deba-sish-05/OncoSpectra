@@ -9,7 +9,12 @@ import numpy as np
 import streamlit as st
 import torch
 
-from gradcam import compute_ensemble_gradcam, make_multimodal_rgb, overlay_heatmap
+from gradcam import (
+    compute_ensemble_gradcam,
+    make_multimodal_rgb,
+    overlay_heatmap,
+    set_segmentation_mask_context,
+)
 from inference import IDH_THRESHOLD, MGMT_THRESHOLD, ensemble_predict, load_deployment_models
 from preprocess import MODALITIES, build_input_tensor, discover_case_files, find_patient_dirs
 from utils import ensure_dir, export_pdf_report, resolve_device, save_uploaded_file
@@ -27,14 +32,13 @@ def _prediction_confidence(prob: float, binary: bool = True) -> float:
     return float(prob)
 
 
-def _clinical_interpretation(idh: str, mgmt: str, grade: str) -> str:
-    if "High Grade" in grade and idh == "Wildtype":
-        return "Profile suggests a biologically aggressive glioma pattern; correlate with pathology and treatment planning."
-    if "Low Grade" in grade and idh == "Mutant":
-        return "Profile suggests a less aggressive glioma phenotype; imaging-genomic pattern is generally favorable."
-    if mgmt == "Methylated":
-        return "MGMT methylation-positive prediction may indicate better alkylating-agent responsiveness; confirm with molecular testing."
-    return "Mixed-risk imaging-genomic profile; integrate with histology, molecular assays, and multidisciplinary review."
+def _confidence_band(prob: float, binary: bool = True) -> str:
+    conf = _prediction_confidence(prob, binary=binary)
+    if conf < 0.60:
+        return "low-borderline"
+    if conf < 0.75:
+        return "intermediate"
+    return "high"
 
 
 def _safe_mid_slice(path: Path, slice_idx: int | None = None) -> np.ndarray:
@@ -67,7 +71,15 @@ def _resolve_preview_slice(modality_paths: dict[str, Path], seg_path: Path | Non
     return 0
 
 
-def _render_modality_previews(modality_paths: dict[str, Path], seg_path: Path | None) -> None:
+@st.cache_data(show_spinner=False)
+def _load_volume(path_str: str) -> np.ndarray:
+    return nib.load(path_str).get_fdata().astype(np.float32)
+
+
+def _render_modality_previews(
+    modality_paths: dict[str, Path],
+    seg_path: Path | None,
+):
     if any(m not in modality_paths for m in MODALITIES):
         return
 
@@ -76,41 +88,112 @@ def _render_modality_previews(modality_paths: dict[str, Path], seg_path: Path | 
 
     cols = st.columns(5)
     for i, mod in enumerate(MODALITIES):
-        sl = _safe_mid_slice(modality_paths[mod], preview_slice)
-        cols[i].image(_normalize_for_display(sl), caption=f"{mod.upper()} (slice {preview_slice})", use_container_width=True)
+        vol = _load_volume(str(modality_paths[mod]))
+        slice_idx = max(0, min(preview_slice, vol.shape[2] - 1))
+        sl = vol[:, :, slice_idx]
+        label = f"{mod.upper()} (slice {preview_slice})"
+        cols[i].image(_normalize_for_display(sl), caption=label, use_container_width=True)
 
     with cols[4]:
         if seg_path is not None and seg_path.exists():
-            seg = _safe_mid_slice(seg_path, preview_slice)
-            st.image(_normalize_for_display(seg), caption="SEG Mask", use_container_width=True)
+            segv = _load_volume(str(seg_path))
+            slice_idx = max(0, min(preview_slice, segv.shape[2] - 1))
+            seg = segv[:, :, slice_idx]
+            st.image(_normalize_for_display(seg), caption=f"SEG Mask (slice {preview_slice})", use_container_width=True)
         else:
             st.info("No SEG")
+
+
+def _cam_localization_text(cam: np.ndarray, seg_mask: np.ndarray | None) -> str:
+    hot = cam > np.percentile(cam, 92)
+    if hot.sum() == 0:
+        return "Model attention is focal but weak; localization confidence is limited."
+
+    if seg_mask is not None:
+        seg_bin = seg_mask > 0
+        overlap = float((hot & seg_bin).sum()) / float(max(1, hot.sum()))
+        if overlap >= 0.60:
+            return "Model attention localizes predominantly within the segmentation-defined tumor core/rim."
+        if overlap >= 0.30:
+            return "Model attention partially overlaps tumor core with extension into adjacent peritumoral region."
+        return "Model attention is focal but only weakly overlaps the available tumor mask."
+
+    ys, xs = np.where(hot)
+    cy = float(np.mean(ys)) / cam.shape[0]
+    cx = float(np.mean(xs)) / cam.shape[1]
+    if 0.25 <= cx <= 0.75 and 0.25 <= cy <= 0.75:
+        return "Model attention localizes a central intratumoral hotspot."
+    return "Model attention localizes a focal eccentric hotspot within abnormal tissue."
+
+
+def _clinical_interpretation_panel(
+    idh_label: str,
+    mgmt_label: str,
+    grade_label: str,
+    idh_prob: float,
+    mgmt_prob: float,
+    grade_prob: float,
+    cam_text: str,
+) -> str:
+    phenotype = []
+    if "Low Grade" in grade_label and idh_label == "Mutant":
+        phenotype.append("Imaging phenotype is most consistent with IDH-mutant lower-grade glioma.")
+    elif "High Grade" in grade_label and idh_label == "Wildtype":
+        phenotype.append("Imaging phenotype is most consistent with IDH-wildtype high-grade glioma biology.")
+    else:
+        phenotype.append("Imaging phenotype indicates mixed-grade/molecular risk features.")
+
+    phenotype.append(cam_text)
+
+    mgmt_band = _confidence_band(mgmt_prob, binary=True)
+    if mgmt_band != "high":
+        phenotype.append("MGMT methylation confidence is intermediate; interpret this marker cautiously with molecular confirmation.")
+    else:
+        phenotype.append("MGMT methylation signal is relatively stable, but clinical decisions should remain pathology-integrated.")
+
+    idh_band = _confidence_band(idh_prob, binary=True)
+    grade_band = _confidence_band(grade_prob, binary=False)
+    if idh_band == "low-borderline" or grade_band == "low-borderline":
+        phenotype.append("One or more outputs are borderline confidence; correlate with full radiology and histopathology context.")
+
+    return " ".join(phenotype)
 
 
 st.set_page_config(page_title="Radiogenomics Dashboard", layout="wide")
 st.markdown(
     """
     <style>
+      .stApp {
+        background: radial-gradient(circle at 20% 10%, #111827 0%, #0b1220 40%, #070d1a 100%);
+        color: #e5e7eb;
+      }
       .card {
-        border: 1px solid #e6e9ef;
+        border: 1px solid #2b3445;
         border-radius: 12px;
         padding: 14px 16px;
-        background: #ffffff;
+        background: #111827;
       }
       .card-title {
         font-size: 0.86rem;
         font-weight: 700;
-        color: #344054;
+        color: #94a3b8;
         margin-bottom: 8px;
       }
       .card-value {
         font-size: 1.12rem;
         font-weight: 700;
-        color: #111827;
+        color: #f8fafc;
       }
       .muted {
-        color: #667085;
+        color: #9ca3af;
         font-size: 0.82rem;
+      }
+      .summary-card {
+        border: 1px solid #2b3445;
+        border-radius: 12px;
+        padding: 14px 16px;
+        background: #0f172a;
+        color: #e5e7eb;
       }
     </style>
     """,
@@ -193,7 +276,10 @@ else:
         st.success("Uploaded files validated and ready.")
 
 if all(m in modality_paths for m in MODALITIES):
-    _render_modality_previews(modality_paths, seg_path)
+    _render_modality_previews(
+        modality_paths=modality_paths,
+        seg_path=seg_path,
+    )
 
 run_clicked = st.button("Run Inference", type="primary")
 if run_clicked:
@@ -210,6 +296,18 @@ if run_clicked:
         result = ensemble_predict(models_bundle["ensemble"], input_tensor)
         idh_target = result.idh_pred
 
+        seg_mask_224 = None
+        if seg_path is not None and seg_path.exists():
+            seg_vol = _load_volume(str(seg_path))
+            seg_slice_idx = max(0, min(int(used_slice), seg_vol.shape[2] - 1))
+            seg_slc = (seg_vol[:, :, seg_slice_idx] > 0).astype(np.float32)
+            seg_mask_224 = (torch.nn.functional.interpolate(
+                torch.from_numpy(seg_slc).unsqueeze(0).unsqueeze(0),
+                size=(224, 224),
+                mode="nearest",
+            ).squeeze().numpy() > 0).astype(np.float32)
+        set_segmentation_mask_context(seg_mask_224)
+
         cam = compute_ensemble_gradcam(
             ensemble_models=models_bundle["ensemble"],
             input_tensor=input_tensor,
@@ -225,6 +323,7 @@ if run_clicked:
     st.session_state["last_overlay"] = overlay
     st.session_state["last_base"] = base_rgb
     st.session_state["last_cam"] = cam
+    st.session_state["last_seg_mask"] = seg_mask_224
     st.success("Inference complete.")
 
 if "last_result" in st.session_state:
@@ -276,6 +375,33 @@ if "last_result" in st.session_state:
         f"Case: {case_id} | Slice Index: {used_slice} | Thresholds: IDH={IDH_THRESHOLD:.2f}, MGMT={MGMT_THRESHOLD:.2f}"
     )
 
+    st.markdown("### Radiogenomic Interpretation")
+    cam_text = _cam_localization_text(
+        cam=st.session_state["last_cam"],
+        seg_mask=st.session_state.get("last_seg_mask"),
+    )
+    interpretation = _clinical_interpretation_panel(
+        idh_label=result.idh_label,
+        mgmt_label=result.mgmt_label,
+        grade_label=result.grade_label,
+        idh_prob=result.idh_prob,
+        mgmt_prob=result.mgmt_prob,
+        grade_prob=result.grade_prob,
+        cam_text=cam_text,
+    )
+    st.markdown(
+        (
+            "<div class='summary-card'>"
+            "<b>Predicted phenotype</b><br/>"
+            f"&bull; IDH: {result.idh_label} ({idh_pct:.1f}%)<br/>"
+            f"&bull; MGMT: {result.mgmt_label} ({mgmt_pct:.1f}%)<br/>"
+            f"&bull; Grade: {result.grade_label} ({grade_pct:.1f}%)<br/><br/>"
+            f"{interpretation}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
     st.markdown("### GradCAM++")
     g1, g2 = st.columns(2)
     g1.image(base_rgb, caption="Anatomical Slice (T1ce)", use_container_width=True)
@@ -285,8 +411,6 @@ if "last_result" in st.session_state:
     report_path = REPORTS_DIR / report_name
 
     if st.button("Generate PDF Report"):
-        interpretation = _clinical_interpretation(result.idh_label, result.mgmt_label, result.grade_label)
-
         saved_path = export_pdf_report(
             output_path=report_path,
             patient_id=case_id,

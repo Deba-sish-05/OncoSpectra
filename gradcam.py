@@ -5,10 +5,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+_SEG_MASK_CONTEXT: np.ndarray | None = None
+
 
 def _minmax_norm(arr: np.ndarray) -> np.ndarray:
     arr = arr.astype(np.float32, copy=False)
     return (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+
+
+def set_segmentation_mask_context(seg_mask: np.ndarray | None) -> None:
+    """
+    Optional context setter for GradCAM cleanup.
+    Expected mask shape: (H, W), values in {0,1} or [0,1].
+    """
+    global _SEG_MASK_CONTEXT
+    if seg_mask is None:
+        _SEG_MASK_CONTEXT = None
+        return
+    _SEG_MASK_CONTEXT = (seg_mask > 0).astype(np.float32)
 
 
 def _crop_brain_multi(
@@ -117,42 +131,84 @@ def _gradcam_pp_raw(
 
 def _keep_largest_region(cam: np.ndarray) -> np.ndarray:
     binary = (cam > 0).astype(np.uint8)
-    num_labels, labels = cv2.connectedComponents(binary)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if num_labels <= 1:
         return cam
 
-    max_area = 0
-    best_label = 1
+    candidates: list[tuple[float, int]] = []
     for lbl in range(1, num_labels):
-        area = int(np.sum(labels == lbl))
-        if area > max_area:
-            max_area = area
-            best_label = lbl
-    return cam * (labels == best_label).astype(np.float32)
+        area = float(stats[lbl, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        x = int(stats[lbl, cv2.CC_STAT_LEFT])
+        y = int(stats[lbl, cv2.CC_STAT_TOP])
+        w = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        h = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        bbox_area = float(max(1, w * h))
+        compactness = area / bbox_area
+
+        region_vals = cam[labels == lbl]
+        mean_act = float(region_vals.mean()) if region_vals.size > 0 else 0.0
+
+        # Strength favors compact high-activation regions.
+        score = mean_act * area * compactness
+        candidates.append((score, lbl))
+
+    if not candidates:
+        return cam
+
+    candidates.sort(reverse=True, key=lambda t: t[0])
+    keep_labels = [candidates[0][1]]
+
+    # Keep top-2 only when second region is competitively strong.
+    if len(candidates) > 1 and candidates[1][0] >= 0.55 * candidates[0][0]:
+        keep_labels.append(candidates[1][1])
+
+    keep_mask = np.isin(labels, keep_labels).astype(np.float32)
+    return cam * keep_mask
 
 
-def _clean_cam(cam: np.ndarray, anatomical_img: np.ndarray) -> np.ndarray:
+def _clean_cam(
+    cam: np.ndarray,
+    anatomical_img: np.ndarray,
+    seg_mask: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Notebook-aligned post-processing:
     - resize
     - Gaussian smoothing
-    - 85th percentile hotspot threshold
-    - largest connected component
+    - 93rd percentile hotspot threshold
+    - morphology opening/closing to remove speckles
+    - top compact connected region filtering
+    - optional segmentation constraint
     - brain masking
     """
     h, w = anatomical_img.shape
     cam = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
     cam = cv2.GaussianBlur(cam, (15, 15), 0)
 
-    th = np.percentile(cam, 85)
+    th = np.percentile(cam, 93)
     cam = np.where(cam >= th, cam, 0).astype(np.float32)
 
+    # Morphological cleanup (denoise and fill tiny holes).
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cam_bin = (cam > 0).astype(np.uint8)
+    cam_bin = cv2.morphologyEx(cam_bin, cv2.MORPH_OPEN, k, iterations=1)
+    cam_bin = cv2.morphologyEx(cam_bin, cv2.MORPH_CLOSE, k, iterations=1)
+    cam = cam * cam_bin.astype(np.float32)
+
     cam = _keep_largest_region(cam)
-    cam = _minmax_norm(cam)
+
+    if seg_mask is not None:
+        seg_r = cv2.resize(seg_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        cam = cam * (seg_r > 0).astype(np.float32)
 
     # Brain mask from anatomical slice (T1ce-like channel in notebook).
     mask = (anatomical_img > np.percentile(anatomical_img, 20)).astype(np.float32)
     cam = cam * mask
+
+    # Slight edge smoothing after masking.
+    cam = cv2.GaussianBlur(cam, (5, 5), 0)
     return _minmax_norm(cam)
 
 
@@ -197,7 +253,10 @@ def compute_gradcam(
     # Notebook uses channel 1 (T1ce) as anatomical guide for CAM cleanup.
     img_ref = x_crop[1].detach().cpu().numpy()
     img_ref = _minmax_norm(img_ref)
-    cam_crop = _clean_cam(raw_cam, img_ref)
+    seg_crop = None
+    if _SEG_MASK_CONTEXT is not None:
+        seg_crop = _SEG_MASK_CONTEXT[y0:y1, x0:x1]
+    cam_crop = _clean_cam(raw_cam, img_ref, seg_mask=seg_crop)
 
     full_cam = np.zeros((h, w), dtype=np.float32)
     region_w = max(1, x1 - x0)
