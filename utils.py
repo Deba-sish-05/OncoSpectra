@@ -241,10 +241,14 @@ def export_pdf_report(
 
     y -= 6
     y = _draw_section_title(c, 36, y, "Clinical Interpretation")
-    interpretation = (
-        "Model attention localizes predominantly within tumor core and peripheral enhancing rim.\n\n"
-        "This visualization supports qualitative interpretation and does not influence prediction outputs."
-    )
+    interpretation = ""
+    if metadata and "interpretation" in metadata:
+        interpretation = str(metadata["interpretation"])
+    else:
+        interpretation = (
+            "Predictions are supportive radiogenomic estimates and should be interpreted "
+            "with histopathology, molecular testing, and multidisciplinary review."
+        )
     c.setFont("Helvetica", 9)
     c.setFillColor(colors.HexColor("#111827"))
     y = _draw_wrapped_text(
