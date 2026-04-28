@@ -450,7 +450,7 @@ if "last_result" in st.session_state:
         unsafe_allow_html=True,
     )
 
-    st.markdown("### GradCAM (Experimental)")
+    st.markdown("### GradCAM ")
     g1, g2 = st.columns(2)
     g1.image(base_rgb, caption="Anatomical Slice (T1ce)", use_container_width=True)
     g2.image(overlay, caption="Localized GradCAM+ Hotspot Overlay", use_container_width=True)
